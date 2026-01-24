@@ -2,13 +2,11 @@ import logging
 import socket
 from typing import Any
 
-import threading
 
 from .utils import (
     EventHandler,
+    InfiniteLoop,
     recv_exact,
-    run_in_background,
-    run_in_background_deferred,
 )
 
 type TcpAddress = tuple[str, int]
@@ -20,7 +18,7 @@ class TcpConnection:
         self.addr = addr
         self.sock = sock
         self.connected = True
-        self.listen_thread: threading.Thread
+        self.listen_thread: InfiniteLoop
 
     def send_message(self, message: bytes) -> None:
         """Send a message to the connection."""
@@ -56,13 +54,13 @@ class TcpServer:
         self.conns: dict[TcpAddress, TcpConnection] = {}
 
     def start(self):
-        self.listen_thread = run_in_background(self._listen_for_conns)
+        self.listen_thread = InfiniteLoop(self._listen_for_conns)
+        self.listen_thread.start()
 
     def stop(self):
         self.running = False
         self.listen_socket.close()
-        if self.listen_thread is not threading.current_thread():
-            self.listen_thread.join()
+        self.listen_thread.stop()
 
     def connect(self, addr: TcpAddress):
         try:
@@ -82,20 +80,15 @@ class TcpServer:
         self.conns.pop(conn.addr, None)
         conn.connected = False
         conn.sock.close()
-
-        if conn.listen_thread is not threading.current_thread():
-            conn.listen_thread.join()
-
+        conn.listen_thread.stop()
         self.on_disconnect.notify(conn, initiated)
 
     def _listen_for_conns(self):
-        self.running = True
-        while self.running:
-            try:
-                sock, addr = self.listen_socket.accept()
-            except Exception:
-                continue
-            self._create_conn(sock, addr, False)
+        try:
+            sock, addr = self.listen_socket.accept()
+        except Exception:
+            return
+        self._create_conn(sock, addr, False)
 
     def _create_conn(
         self, sock: socket.socket, addr: TcpAddress, initiated: bool
@@ -103,28 +96,27 @@ class TcpServer:
         conn = TcpConnection(sock, addr)
         self.conns[addr] = conn
 
-        conn.listen_thread = run_in_background_deferred(self._recv_loop, conn)
+        conn.listen_thread = InfiniteLoop(lambda: self._recv_loop(conn))
         self.on_connect.notify(conn, initiated)
         conn.listen_thread.start()
         return conn
 
     def _recv_loop(self, conn: TcpConnection):
         if not conn.connected:
-            return
+            conn.listen_thread.stop()
 
         try:
-            while self.running:
-                len_bytes = recv_exact(conn.sock, 4)
-                if len_bytes is None:
-                    break
+            len_bytes = recv_exact(conn.sock, 4)
+            if len_bytes is None:
+                raise Exception("Connection closed")
 
-                length = int.from_bytes(len_bytes, byteorder="big")
-                message = recv_exact(conn.sock, length)
-                if message is None:
-                    break
+            length = int.from_bytes(len_bytes, byteorder="big")
+            message = recv_exact(conn.sock, length)
+            if message is None:
+                raise Exception("Connection closed")
 
-                self.on_message.notify(conn, message)
-        finally:
+            self.on_message.notify(conn, message)
+        except Exception:
             if conn.connected:
                 self._disconnect(conn, False)
 

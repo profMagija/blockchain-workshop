@@ -5,7 +5,8 @@ import time
 
 import click
 
-from .blockchain import BlockchainNode, Transaction
+from .blockchain import BlockchainNode
+from .blockchain_types import Transaction
 from .crypto import PrivateKey
 from .gossip import Gossip
 from .messaging import Messaging
@@ -199,13 +200,13 @@ def gossip(nd: bool):
 @click.option("--nd", is_flag=True, help="Enable network discovery.")
 @click.option("--ds", is_flag=True, help="Dump blockchain state periodically.")
 @click.option(
-    "--state-dir", default=":memory:", help="Directory to store blockchain state."
+    "--state-dir", default=".stor", help="Directory to store blockchain state."
 )
 def blockchain(nd: bool, ds: bool, state_dir: str):
 
     net = TcpServer((_host, _port))
     msg = Messaging(net)
-    network = P2PNode(net, msg, bootstrap_nodes=[parse_address(p) for p in _peers])
+    network = P2PNode(net, msg, 4, bootstrap_nodes=[parse_address(p) for p in _peers])
     gossip = Gossip(network)
     search = Search(gossip)
     sm = StorageMaster(state_dir)

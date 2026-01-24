@@ -24,17 +24,8 @@ def run_in_background[**P](
     *args: P.args,
     **kwargs: P.kwargs,
 ) -> threading.Thread:
-    thread = run_in_background_deferred(task, *args, **kwargs)
-    thread.start()
-    return thread
-
-
-def run_in_background_deferred[**P](
-    task: Callable[P, None],
-    *args: P.args,
-    **kwargs: P.kwargs,
-) -> threading.Thread:
     thread = threading.Thread(target=task, args=args, kwargs=kwargs, daemon=True)
+    thread.start()
     return thread
 
 
@@ -59,3 +50,25 @@ def safe_invoke[**P, T](
         return func(*args, **kwargs)
     except Exception:
         logging.exception("Error invoking function %s", func, stack_info=True)
+
+
+class InfiniteLoop:
+    def __init__(self, handler: Callable[[], None], sleep_time: float | None = None):
+        self.handler = handler
+        self.sleep_time = sleep_time
+        self._stopped = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stopped.set()
+        if self._thread is not threading.current_thread():
+            self._thread.join()
+
+    def _loop(self):
+        while not self._stopped.is_set():
+            safe_invoke(self.handler)
+            if self.sleep_time is not None:
+                self._stopped.wait(self.sleep_time)

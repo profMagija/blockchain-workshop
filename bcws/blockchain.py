@@ -2,21 +2,98 @@ from __future__ import annotations
 
 import json
 import time
-import hashlib
 import typing as t
 import logging
 
 
-from .crypto import PrivateKey, PublicKey
+from .blockchain_types import Block, Transaction
 from .gossip import Gossip
 from .p2p import P2PPeer
 from .search import Search
 from .storage import Storage, StorageMaster
-from .utils import run_in_background
+from .utils import InfiniteLoop
 
 _DIFFICULTY = 7
 _MAX_TRANSACTIONS_PER_BLOCK = 10
 _BLOCK_REWARD = 10000
+
+
+class Mempool:
+    def __init__(self, gossip: Gossip):
+        self.gossip = gossip
+        # --------8<--------
+        self._transactions: dict[bytes, Transaction] = {}
+        self._last_seen: dict[bytes, float] = {}
+
+        self.gossip.register_handler("bc:new_tx", self._handle_new_tx)
+        # --------8<--------
+
+    def start(self) -> None:
+        """Starts the background cleanup of old transactions."""
+        # <<raise NotImplementedError
+        # --------8<--------
+        self._cleanup_thread = InfiniteLoop(self._cleanup_loop, 60)
+        self._cleanup_thread.start()
+        # --------8<--------
+
+    def stop(self) -> None:
+        """Stops the background cleanup of old transactions."""
+        # <<raise NotImplementedError
+        # --------8<--------
+        self._cleanup_thread.stop()
+        # --------8<--------
+
+    def announce_transaction(self, tx: Transaction) -> None:
+        """Announce a new transaction to the network, and adds it to itself."""
+        # <<raise NotImplementedError
+        # --------8<--------
+        logging.info("Announcing new transaction %s", tx)
+        self.gossip.broadcast("bc:new_tx", tx.serialize().encode())
+        self._add_transaction(tx)
+        # --------8<--------
+
+    def get_transactions(self) -> list[Transaction]:
+        """Get all transactions in the mempool."""
+        # <<raise NotImplementedError
+        # --------8<--------
+        return list(self._transactions.values())
+        # --------8<--------
+
+    def evict_transaction(self, tx: Transaction) -> None:
+        """Removes the transaction from the mempool (either because it was
+        included in a block, or timed out).
+        """
+        # <<raise NotImplementedError
+        # --------8<--------
+        logging.info("Evicting transaction %s", tx)
+        tx_hash = tx.hash()
+        self._transactions.pop(tx_hash, None)
+        self._last_seen.pop(tx_hash, None)
+
+    def _add_transaction(self, tx: Transaction) -> None:
+        tx_hash = tx.hash()
+        if tx_hash not in self._transactions:
+            logging.info("Discovered new transaction %s", tx)
+        self._transactions[tx_hash] = tx
+        self._last_seen[tx_hash] = time.time()
+
+    def _handle_new_tx(self, peer: P2PPeer, message: bytes):
+        tx = Transaction.deserialize(message.decode())
+
+        if not tx.validate_signature():
+            logging.info("Invalid transaction signature: %s", tx)
+            return False
+
+        self._add_transaction(tx)
+        return True
+
+    def _cleanup_loop(self):
+        now = time.time()
+        for tx in self.get_transactions():
+            if self._last_seen[tx.hash()] + 60 < now:
+                self.evict_transaction(tx)
+
+    # --------8<--------
 
 
 class Blockchain:
@@ -112,121 +189,6 @@ class Blockchain:
     # ---------8<---------
 
 
-class Block:
-    def __init__(self):
-        self.number = 0
-        self.nonce = 0
-        self.parent_hash: bytes = b""
-        self.coinbase: bytes = b""
-        self.transactions: list[Transaction] = []
-        self.hash: bytes = b""
-
-    def has_difficulty(self, difficulty: int):
-        self.calculate_hash()
-        target = "0" * difficulty
-        return self.hash.hex().startswith(target)
-
-    def calculate_hash(self):
-        data = self.serialize()
-        self.hash = hashlib.sha256(data.encode()).digest()
-        return self.hash
-
-    def serialize(self):
-        data = ""
-        data += f"{self.number}"
-        data += f":{self.nonce}"
-        data += f":{self.parent_hash.hex()}"
-        data += f":{self.coinbase.hex()}"
-        for tx in self.transactions:
-            data += f":{tx.serialize()}"
-        return data
-
-    @classmethod
-    def deserialize(cls, data: str):
-        block = cls()
-        number, nonce, parent, coinbase, *transactions = data.split(":")
-        block.number = int(number)
-        block.nonce = int(nonce)
-        block.parent_hash = bytes.fromhex(parent)
-        block.coinbase = bytes.fromhex(coinbase)
-        block.transactions = [Transaction.deserialize(tx) for tx in transactions]
-        block.calculate_hash()
-        return block
-
-    def to_json(self) -> dict[str, t.Any]:
-        self.calculate_hash()
-        return {
-            "number": self.number,
-            "nonce": self.nonce,
-            "parent_hash": self.parent_hash.hex(),
-            "coinbase": self.coinbase.hex(),
-            "transactions": [tx.to_json() for tx in self.transactions],
-            "hash": self.hash.hex(),
-        }
-
-    def __repr__(self):
-        return f"<Block {self.number} 0x..{self.hash.hex()[-8:]}>"
-
-
-class Transaction:
-    def __init__(self):
-        self.sender = b""
-        self.receiver = b""
-        self.nonce = 0
-        self.amount = 0
-        self.sig = b""
-
-    def data_to_sign(self):
-        sender = self.sender.hex()
-        receiver = self.receiver.hex()
-        return f"{sender},{receiver},{self.nonce},{self.amount}"
-
-    def serialize(self):
-        assert self.sig, "Transaction not signed"
-
-        data_to_sign = self.data_to_sign()
-        sig = self.sig.hex()
-        return f"{data_to_sign},{sig}"
-
-    @classmethod
-    def deserialize(cls, data: str):
-        tx = cls()
-        sender, receiver, nonce, amount, sig = data.split(",")
-        tx.sender = bytes.fromhex(sender)
-        tx.receiver = bytes.fromhex(receiver)
-        tx.nonce = int(nonce)
-        tx.amount = int(amount)
-        tx.sig = bytes.fromhex(sig)
-        return tx
-
-    def sign(self, key: PrivateKey):
-        data = self.data_to_sign().encode()
-        self.sig = key.sign(data)
-
-    def validate_signature(self):
-        assert self.sig, "Transaction not signed"
-        key = PublicKey.from_bytes(self.sender)
-        return key.verify(self.data_to_sign().encode(), self.sig)
-
-    def hash(self):
-        return hashlib.sha256(self.serialize().encode()).digest()
-
-    def to_json(self) -> dict[str, t.Any]:
-        return {
-            "hash": self.hash().hex(),
-            "sender": self.sender.hex(),
-            "receiver": self.receiver.hex(),
-            "nonce": self.nonce,
-            "amount": self.amount,
-            "sig": self.sig.hex(),
-        }
-
-    def __repr__(self):
-        return (
-            f"<Transaction {self.sender.hex()} -> {self.receiver.hex()} {self.amount}>"
-        )
-
-
 class BlockchainState:
     def __init__(self, block_number: int):
         self.block_number = block_number
@@ -271,55 +233,6 @@ class BlockchainState:
         state.balances = self.balances.copy()
         state.nonces = self.nonces.copy()
         return state
-
-
-class Mempool:
-    def __init__(self, gossip: Gossip):
-        self.gossip = gossip
-        self._transactions: dict[bytes, Transaction] = {}
-        self._last_seen: dict[bytes, float] = {}
-
-        self.gossip.register_handler("bc:new_tx", self._handle_new_tx)
-
-    def start(self):
-        run_in_background(self._cleanup_loop)
-
-    def announce_transaction(self, tx: Transaction):
-        logging.info("Announcing new transaction %s", tx)
-        self.gossip.broadcast("bc:new_tx", tx.serialize().encode())
-        self.add_transaction(tx)
-
-    def get_transactions(self) -> list[Transaction]:
-        return list(self._transactions.values())
-
-    def evict_transaction(self, tx: Transaction) -> None:
-        logging.info("Evicting transaction %s", tx)
-        self._transactions.pop(tx.hash(), None)
-        self._last_seen.pop(tx.hash(), None)
-
-    def add_transaction(self, tx: Transaction) -> None:
-        if tx.hash() not in self._transactions:
-            logging.info("Discovered new transaction %s", tx)
-        self._transactions[tx.hash()] = tx
-        self._last_seen[tx.hash()] = time.time()
-
-    def _handle_new_tx(self, peer: P2PPeer, message: bytes):
-        tx = Transaction.deserialize(message.decode())
-
-        if not tx.validate_signature():
-            logging.info("Invalid transaction signature: %s", tx)
-            return False
-
-        self.add_transaction(tx)
-        return True
-
-    def _cleanup_loop(self):
-        now = time.time()
-        while True:
-            for tx in self.get_transactions():
-                if self._last_seen[tx.hash()] + 60 < now:
-                    self.evict_transaction(tx)
-            time.sleep(10)
 
 
 class ForkManager:
@@ -611,8 +524,12 @@ class BlockchainNode:
 
     def start(self):
         self.mempool.start()
+        self._block_producer_thread = InfiniteLoop(self._block_producer)
+        self._block_producer_thread.start()
 
-        run_in_background(self._block_producer)
+    def stop(self) -> None:
+        self._block_producer_thread.stop()
+        self.mempool.stop()
 
     def get_block_by_number(self, number: int) -> Block:
         return self.canonicaliser.get_block_by_number(number)
@@ -629,14 +546,13 @@ class BlockchainNode:
         self.mempool.announce_transaction(tx)
 
     def _block_producer(self):
-        while True:
-            block = self._produce_block()
-            if block is None:
-                continue
+        block = self._produce_block()
+        if block is None:
+            return
 
-            logging.info("Produced block %s", block)
-            self.fork_manager.produce_block(block)
-            self.gossip.broadcast("bc:new_block", block.serialize().encode())
+        logging.info("Produced block %s", block)
+        self.fork_manager.produce_block(block)
+        self.gossip.broadcast("bc:new_block", block.serialize().encode())
 
     def _produce_block(self):
         tip_block = self.fork_manager.get_highest_block()

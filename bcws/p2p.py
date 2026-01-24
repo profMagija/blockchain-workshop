@@ -4,10 +4,9 @@ from .messaging import Messaging
 
 # --------8<--------
 import logging
-import threading
 from .network import parse_address
 from .messaging import MessageHandler, MessageResponseHandler
-from .utils import run_in_background
+from .utils import InfiniteLoop
 import random
 
 _P2P_HELLO = "p2p:hello"
@@ -68,8 +67,11 @@ class P2PNode:
         """
         # <<raise NotImplementedError
         # --------8<--------
-        self._stopped = threading.Event()
-        self._peer_loop_thread = run_in_background(self._peer_loop)
+        self._peer_loop_thread = InfiniteLoop(self._peer_loop, 1)
+        self._peer_loop_thread.start()
+
+        for addr in self.bootstrap_nodes:
+            self.connect_to_peer(addr)
         # --------8<--------
 
     def stop(self) -> None:
@@ -79,10 +81,6 @@ class P2PNode:
         """
         # <<raise NotImplementedError
         # --------8<--------
-        self._stopped.set()
-        if self._peer_loop_thread is not threading.current_thread():
-            self._peer_loop_thread.join()
-
         for peer in list(self.peers):
             self.disconnect_peer(peer)
         # --------8<--------
@@ -223,23 +221,20 @@ class P2PNode:
         self._connect_to_peers(addrs)
 
     def _peer_loop(self):
-        while not self._stopped.is_set():
-            if len(self.peers) == 0:
-                # re-bootstrap
-                self._connect_to_peers(self.bootstrap_nodes)
-            if len(self.peers) < self.min_peers:
-                for peer in list(self.peers):
-                    self.msg.send_message(
-                        peer.conn,
-                        _P2P_GET_PEERS,
-                        b"",
-                        self._handle_get_peers_response,
-                    )
-            elif len(self.peers) > self.max_peers:
-                peer = random.choice(list(self.peers))
-                self.disconnect_peer(peer)
-
-            self._stopped.wait(1)
+        if len(self.peers) == 0:
+            # re-bootstrap
+            self._connect_to_peers(self.bootstrap_nodes)
+        elif len(self.peers) < self.min_peers:
+            for peer in list(self.peers):
+                self.msg.send_message(
+                    peer.conn,
+                    _P2P_GET_PEERS,
+                    b"",
+                    self._handle_get_peers_response,
+                )
+        elif len(self.peers) > self.max_peers:
+            peer = random.choice(list(self.peers))
+            self.disconnect_peer(peer)
 
     def _connect_to_peers(self, addrs: list[TcpAddress]) -> None:
         addrs = addrs.copy()

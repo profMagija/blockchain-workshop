@@ -1,8 +1,7 @@
-import threading
 import time
 from typing import Callable
 
-from .utils import run_in_background, safe_invoke
+from .utils import InfiniteLoop, safe_invoke
 from .network import TcpServer, TcpConnection
 
 
@@ -57,13 +56,11 @@ class Messaging:
         ] = {}
 
     def start(self):
-        self._stopped = threading.Event()
-        self._process_thread = run_in_background(self._process_timeouts)
+        self._process_thread = InfiniteLoop(self._process_timeouts, 0.1)
+        self._process_thread.start()
 
     def stop(self):
-        self._stopped.set()
-        if self._process_thread is not threading.current_thread():
-            self._process_thread.join()
+        self._process_thread.stop()
 
     def register_handler(self, kind: str, handler: MessageHandler):
         if kind in self._message_handlers:
@@ -128,15 +125,12 @@ class Messaging:
         return self._last_message_id
 
     def _process_timeouts(self) -> None:
-        while not self._stopped.is_set():
-            now = time.time()
-            handlers_to_invoke: list[tuple[TcpConnection, MessageResponseHandler]] = []
-            for key, (expire_at, handler) in list(self._response_handlers.items()):
-                if now >= expire_at:
-                    handlers_to_invoke.append((key[0], handler))
-                    del self._response_handlers[key]
+        now = time.time()
+        handlers_to_invoke: list[tuple[TcpConnection, MessageResponseHandler]] = []
+        for key, (expire_at, handler) in list(self._response_handlers.items()):
+            if now >= expire_at:
+                handlers_to_invoke.append((key[0], handler))
+                del self._response_handlers[key]
 
-            for peer, handler in handlers_to_invoke:
-                safe_invoke(handler, peer, None)
-
-            self._stopped.wait(1.0)
+        for peer, handler in handlers_to_invoke:
+            safe_invoke(handler, peer, None)

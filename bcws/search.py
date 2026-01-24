@@ -5,7 +5,7 @@ from typing import Callable
 
 from .gossip import Gossip
 from .p2p import P2PPeer
-from .utils import run_in_background, safe_invoke
+from .utils import InfiniteLoop, safe_invoke
 
 _SEARCH_TIMEOUT = 30
 
@@ -25,11 +25,11 @@ class Search:
         self._return_paths: dict[bytes, tuple[P2PPeer, float]] = {}
 
     def start(self) -> None:
-        self._stopped = threading.Event()
-        self._timeout_loop_thread = run_in_background(self._timeout_loop)
+        self._timeout_loop_thread = InfiniteLoop(self._timeout_loop, 5)
+        self._timeout_loop_thread.start()
 
     def stop(self) -> None:
-        pass
+        self._timeout_loop_thread.stop()
 
     def register(self, kind: str, handler: SearchHandler):
         if kind in self._search_handlers:
@@ -89,19 +89,17 @@ class Search:
         self.gossip.broadcast("search:" + kind, msg_id + payload)
 
     def _timeout_loop(self) -> None:
-        while not self._stopped.is_set():
-            for k, (l, rh, ts) in list(self._queries.items()):
-                if time.time() - ts > _SEARCH_TIMEOUT:
-                    with l:
-                        if k not in self._queries:
-                            continue
-                        self._queries.pop(k, None)
-                        safe_invoke(rh, None)
-            for k, (_, ts) in list(self._return_paths.items()):
-                if time.time() - ts > _SEARCH_TIMEOUT:
-                    self._return_paths.pop(k, None)
+        for k, (l, rh, ts) in list(self._queries.items()):
+            if time.time() - ts > _SEARCH_TIMEOUT:
+                with l:
+                    if k not in self._queries:
+                        continue
+                    self._queries.pop(k, None)
+                    safe_invoke(rh, None)
 
-            self._stopped.wait(5)
+        for k, (_, ts) in list(self._return_paths.items()):
+            if time.time() - ts > _SEARCH_TIMEOUT:
+                self._return_paths.pop(k, None)
 
 
 def _make_msg_id() -> bytes:

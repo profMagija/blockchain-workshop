@@ -4,10 +4,9 @@ from .p2p import P2PNode, P2PPeer
 
 # --------8<--------
 import time
-import threading
 import os
 
-from .utils import run_in_background, safe_invoke
+from .utils import InfiniteLoop, safe_invoke
 
 # --------8<--------
 
@@ -27,16 +26,14 @@ class Gossip:
     def start(self) -> None:
         # <<raise NotImplementedError
         # --------8<--------
-        self._stopped = threading.Event()
-        self._cleanup_thread = run_in_background(self._cleanup_loop)
+        self._cleanup_thread = InfiniteLoop(self._cleanup_loop, 60)
+        self._cleanup_thread.start()
         # --------8<--------
 
     def stop(self) -> None:
         # <<raise NotImplementedError
         # --------8<--------
-        self._stopped.set()
-        if self._cleanup_thread is not threading.current_thread():
-            self._cleanup_thread.join()
+        self._cleanup_thread.stop()
         # --------8<--------
 
     def broadcast(self, kind: str, payload: bytes) -> None:
@@ -81,14 +78,12 @@ class Gossip:
 
     def _cleanup_loop(self) -> None:
         """Periodically remove expired messages."""
-        while True:
-            now = time.time()
-            expired_keys = [
-                key for key, ts in self.seen_messages.items() if now - ts > _EXPIRY_TIME
-            ]
-            for key in expired_keys:
-                del self.seen_messages[key]
-            self._stopped.wait(60)
+        now = time.time()
+        expired_keys = [
+            key for key, ts in self.seen_messages.items() if now - ts > _EXPIRY_TIME
+        ]
+        for key in expired_keys:
+            del self.seen_messages[key]
 
 
 def _make_msg_id() -> bytes:

@@ -18,319 +18,263 @@ The system consists of multiple components, which use the abstractions provided 
 
 ### The network layer
 
-For the network layer, your task will be to build a simple UDP networking handler, that can send and receive opaque byte blocks.
+For the network layer, you are provided with a simple TCP-based networking layer, which allows you to send and receive messages between nodes. The system is based on a simple event-driven architecture, where you can register event handlers for different events.
 
-Over that, you will be provided with a simple messaging layer, that will handle message serialization and deserialization, registration of handlers for specific message kinds, and sending and receiving messages.
+The system allows subscription to following events:
+
+- `on_connect(conn, incoming)` - called when a new connection is established. `conn` is the connection object, and `incoming` is a boolean indicating if the connection was initiated by us (`False`) or by the peer (`True`).
+- `on_disconnect(conn, incoming)` - called when a connection is closed. `conn` is the connection object, and `incoming` is a boolean indicating if the disconnect was initiated by us (`False`) or by the peer (`True`).
+- `on_message(conn, message)` - called when a new message is received. `conn` is the connection object, and `message` is the received message.
+
+Very rarely to you need to use the raw network layer directly, as most of the time you will be using the higher-level abstractions built on top of it.
+
+On top of the network layer, you are provided with a simple messaging layer, which allows you to send and receive messages between nodes. The messaging layer is based on a simple message format, where each message has a **kind** and a **payload**. Furthermore, messages can be responded to, allowing for request-response style communication.
+
+To use the messaging layer, you first need to register a message handler using `register_handler` for a specific message kind. The handler will be called whenever a message of that kind is received. If the message is a request, the handler should return the response payload (or `None` to indicate no response). If the message is not a request, the handler should return `None`.
+
+To send a message, you can use the `send_message` method. If the message is a request, you should specify the `response_handler` parameter, which is a function that will be called when the response is received. If the response does not arrive within a time limit, the `response_handler` will be called with `None`.
 
 ### The peering layer
 
-For the peering layer, your task will be to build a simple peering handler, that will allow nodes to connect to each other, and maintain a list of peers. The number of peers per node is limited, to prevent any single node from being overwhelmed.
+For the peering layer, your task will be to build a simple P2P node, that will allow nodes to connect to each other, and maintain a list of peers. The number of peers per node is limited, to prevent any single node from being overwhelmed. The P2P protocol is very simple:
 
-On top of that, you will build a simple gossip layer, that will allow nodes to broadcast messages to each other, even if they are not directly connected, by passing the messages through the network.
+* When a node connects to another node, it sends a `p2p:hello` message, containing its address. The receiver should either:
+  * resont with `\x01` + its list of peers, if it accepts the connection, or
+  * respond with `\x00` + its list of peers, if it rejects the connection
 
-On top of that, you will also build a simple unstructured search algorithm, that will allow nodes to search for specific objects in the network.
+  If the connection is accepted, both nodes should add each other to their peer list. Otherwise, the connection should be closed, and the node should try to connect to one of the peers provided in the response.
+
+  The list of peers is a comma-separated list of `host:port` strings.
+
+* Nodes can send `p2p:get_peers` messages to ask for the list of peers of the other node. The receiver should respond with a list of its peers.
+
+On top of that, you will build a simple gossip layer, that will allow nodes to broadcast messages to each other, even if they are not directly connected, by passing the messages through the network. The gossip protocol is very simple:
+
+* A gossip message contains a random 16-byte identifier created at the sender side.
+* When a node wants to send a gossip message, it sends a `gossip:<kind>` message to all of its peers, containing the message identifier and the message payload.
+* When a node receives a `gossip:<kind>` message:
+  * It checks if it has already seen the message identifier. If it has, it ignores the message.
+  * If it hasn't seen the message identifier, it processes the message (by calling the registered handler) which should return `True` if the message was processed successfully, or `False` if it invalid.
+  * If the message was processed successfully, it broadcasts the message to all of its peers (except the one it received the message from).
+
+On top of that, you are provided with a simple search implementation, which uses the gossip layer to search for messages in the network, and uses the return-path to send the response back to the requester.
+
 
 ### The blockchain layer
 
 For the blockchain layer, you will be provided with the most of the "dirty" stuff: 
 * the state management component, which hangles persistence of the blockchain,
-* the mempool component, which handles discovery of the transactions that are not yet in the blockchain,
 * the fork choice component, which handles the selection of the correct chain in case of a fork
+* the chain canonicalization component, which handles applying the blocks to the state, fetching missing blocks from the network, and rewinding in case of reorgs
 
 Your task will be to implement the core of the blockchain: 
 * the state transition function, which given a block and the current state of the blockchain, will return the new state of the blockchain,
 * the block building function, which given the current state of the blockchain and the mempool (list of all transactions), will return a new block that can be added to the blockchain.
+* the mempool management, which will handle collecting transactions from the network, and providing them to the block builder.
 
+# The tasks
 
-# Part 1: Networking
+## Part 1: P2P Node
 
-## Introduction
+### Introduction
 
-In this part we will build a simple networking layer that will allow us to send messages between nodes. The networking layer will be based on the `socket` module in Python, UDP protocol, and will be able to send and receive messages.
+In this part, you will implement a simple P2P node, that will allow nodes to connect to each other, and maintain a list of peers.
 
-## Your task
+### Your task
 
-In the file [networking.py](bcws/networking.py) you will find a skeleton of a `UDPNode` class. This class should implement a simple UDP networking layer that will allow us to send and receive messages between nodes.
+In the file [p2p.py](bcws/p2p.py), you will find a skeleton of the `P2PNode` class. Your task is to implement the following methods:
 
-Your task is to implement this class. The class should have the following methods:
+- `__init__`: A constructor that initializes the P2P node with the given parameters. You are given the following:
+  -  `TcpServer` - instance to use for connecting to other nodes
+  -  `Messaging` - instance to use for sending and receiving messages
+  -  `max_peers` - maximum number of peers to maintain (you should always keep at least half of this number, and never exceed double this number).
+  -  `bootstrap_nodes` - list of initial nodes to connect to when starting the node
+- `start`: Starts any background tasks, and connects to the bootstrap nodes.
+- `stop`: Stops all background tasks, and disconnects from all peers.
+- `register_handler`: Registers a message handler for a specific p2p message kind. The handler is similar to the messaging layer handlers, but takes a `P2PPeer` instead of a `TcpConnection`.
+- `connect_to_peer`: Connects to a new peer at the given address. Should send a `p2p:hello` message, and handle the response accordingly.
+- `disconnect_peer`: Disconnects from the given peer, and removes it from the peer list.
+- `send_message`: Sends a message to the given peer, by invoking the messaging layer.
+- `broadcast_message`: Broadcasts a message to all connected peers.
 
-* `__init__` - a constructor that should initialize the socked and bind it to the given port. The arguments are:
-  * `port: int` - the port to bind the socket to. You should listen on all addresses.
-  * `handler: UDPHandler` - an object that will handle incoming messages. You must call this objects `handle_receive(data, peer)` method when a message is received.
-* `start` - a method that starts the node in the background. This method should start a new thread that will listen for incoming messages.
-* `send` - a method that sends a message to a given address. The arguments are:
-  * `peer: UDPPeer` - the address to send the message to.
-  * `data: bytes` - the data to send.
+Keep in mind that the P2P node should maintain the peer list, by connecting to new peers when the number of peers drops below half of the maximum, and disconnecting from peers when the number of peers exceeds the maximum. The peer count can be checked periodically in a background task.
 
-# Part 2: Messaging
+### Messages used
 
-To simplify the communication between nodes, we will introduce a simple messaging abstraction over the raw UDP layer. Each message sent will contain the **message kind** and **message payload**. The kind is a string identifying the type of the message, and the payload is the actual data.
+- `p2p:hello`
+  - Request: `host:port` string of the sender
+  - Resopnse: `(0x00 | 0x01) + peer_list`
+    - `0x00` - connection rejected
+    - `0x01` - connection accepted
+    - `peer_list` - comma-separated list of `host:port` strings
+- `p2p:get_peers`
+  - Request: empty
+  - Response: `peer_list`
+    - `peer_list` - comma-separated list of `host:port` strings
 
-You can use the `UDPMessaging` class to send and receive messages. To send the message simply construct it using the `UDPMessage` constructor, and send it using the `send` method:
+## Part 2: Gossip
 
-```python
-messaging = UDPMessaging(1234)
-message = UDPMessage('hello', ['some', 'data', 'here'])
-messaging.send(UDPPeer('192.168.10.1', 1235), message)
-```
-
-To receive the message, you first have to register the message handler. The handler will be invoked whenever a message is received. It must be a function that takes two arguments: the received message and the peer that sent the message.
-
-```python
-def _handle_hello(message: UDPMessage, peer: UDPPeer):
-  print(f'Received message from {peer}: {message.kind} {message.data}')
-
-messaging.register('hello', _handle_hello)
-```
-
-For each message kind, we will define the format of the payload as it is introduced.
-
-Multiple systems will later on implement a similar `kind`/`payload`/`register` based system, so it is important to understand how it works.
-
-# Part 3: Peering
-
-## Introduction
-
-Peering is a process of connecting multiple nodes together in a peer-to-peer network. In this part we will build a simple peering layer that will allow us to connect multiple nodes together into a mesh network.
-
-Each node has a unique identifier, and maintains a list of peers. When a node connects to another node, it sends an `p2p:announce` message to the other node, which should add the sender as a peer. The receiver should also respond with an `p2p:announce` message, so that the sender can add the receiver as a peer.
-
-The nodes can send eachother `p2p:ask_for_peers` to ask for the list of peers of the other node. The receiver should respond with a `p2p:peers` message, containing the addresses of its peers.
-
-### Messages involved
-
-We will use a number of messages with the following kinds:
-
-* `p2p:announce` - the sender announces itself to the receiver, who should add it as a peer. Payload: `id: str`.
-* `p2p:ask_for_peers` - the sender asks the receiver for the list of its peers. Payload: `None`.
-* `p2p:peers` - the sender is sending its list of peers to the receiver. Payload: `peers: List[str]`. Send as an answer to `p2p:ask_for_peers`.
-* `p2p:ping` - the sender is pinging the receiver to check if it is still alive. Payload: `None`.
-* `p2p:pong` - the sender is responding to the ping. Payload: `None`. Sent as an answer to `p2p:ping`.
-
-## Your task
-
-In the file [peering.py](bcws/peering.py) you will find a skeleton of a `P2PNetwork` class. This class should implement a simple peering layer that will allow us to connect multiple nodes together.
-
-Your task is to implement this class. The class should have the following methods:
-
-* `__init__` - a constructor that should initialize the network. The arguments are:
-  * `messaging: UDPMessaging` - a messaging layer that will be used to send and receive messages.
-  * `peer_limit: int` - the maximum number of peers that can be connected to this node.
-* `announce_to` - a method that should announce this node to a given address, and ask for the peer's peers. The arguments are:
-  * `peer: UDPPeer` - the peer to announce to.
-* `add_peer` - a method that should add a peer to the list of our peers. It just takes the `peer: P2PPeer` as an argument. Make sure that:
-  * We are not connected to the same peer multiple times.
-  * We are not connected to ourselves.
-  * We are not connected to more peers than `peer_limit`. If we would exceed the limit, we should disconnect from one of the peers at random.
-  * After we connect to the peer, we should announce ourselves to the peer, just in case they don't know about us yet.
-* `start` - a method that should start the network in the background. In the background process, we should periodically:
-  * ping all of our peers to check if they are still alive.
-  * remove all peers that we haven't seen for a while.
-* `send` - a method that should send a message to a given peer. The arguments are:
-  * `peer: P2PPeer` - the peer to send the message to.
-  * `data: UDPMessage` - the message to send.
-* `broadcast` - a method that should send a message to all of our peers. The arguments are:
-  * `data: UDPMessage` - the message to send.
-
-# Part 4: Gossip
-
-## Introduction
+### Introduction
 
 Gossip is a simple protocol that allows nodes to share information with each other, even if they are not directly connected. In this part we will build a simplified gossip layer that will allow us to share messages between nodes.
 
-Each node maintains a list of messages that it has seen. When a node receives a new message (via a `gossip:send`), it should add it to the list of seen messages, and broadcast it to all of its peers.
+Each node maintains a list of messages that it has seen. When a node receives a new message (via a `gossip:<kind>`), it should add it to the list of seen messages, and broadcast it to all of its peers.
 
-Gossip is implemented similarly to messaging, where each message has a kind and a payload, and you register handlers for specific kinds. Note that it still uses the previously implemented messaging layer, wrapping each gossip message in a `gossip:send` UDP message (which is then wrapped in a UDP packet (which is then wrapped in an IP packet (which is then wrapped in an Ethernet frame (and its turtles all the way down)))).
+Gossip is implemented similarly to messaging, where each message has a kind and a payload, and you register handlers for specific kinds. Note that it still uses the previously implemented messaging layer, wrapping each gossip message in a `gossip:<kind>` message.
 
-Each message contains a unique identifier, which is the SHA256 hash of the message kind and payload. This identifier is then used to check if we have already seen the message. This also means that the users of the gossip layer should not send the same message multiple times, as it will be ignored.
+Each message contains a unique random identifier. This identifier is used to check if we have already seen the message.
 
-## Your task
+### Your task
 
 In the file [gossip.py](bcws/gossip.py) you will find a skeleton of a `Gossip` class. This class should implement a simple gossip layer that will allow us to share messages between nodes. Your task is to implement this class. The class should have the following methods:
 
-* `__init__` - a constructor that should initialize the gossip layer. The arguments are:
-  * `messaging: UDPMessaging` - a messaging layer that will be used to send and receive messages.
-  * `network: P2PNetwork` - the reference to the peering network, for peer management.
-* `start` - a method that should start the gossip layer in the background. In the background process, we should periodically time out messages we received more than `message_timeout` seconds ago.
-* `broadcast` - a method that should broadcast a message to the entire network, by gossiping it to all of our peers. The argument is `message: GossipMessage`.
+- `__init__`: A constructor that initializes the gossip layer with the given P2P node.
+- `start`: Starts any background tasks needed for the gossip layer.
+- `stop`: Stops all background tasks.
+- `broadcast`: Broadcasts a message to all peers.
+- `register_handler`: Registers a message handler for a specific gossip message kind.
 
-# Part 5: Search
+Keep in mind that the gossip layer should maintain a list of seen messages, and should not process messages that have already been seen. Also, the list of seen messages should be cleaned up periodically to prevent it from growing indefinitely.
 
-## Introduction
+### Messages used
 
-In this part we will build a simple unstructured search layer that will allow us to search for messages in the network. The search layer will be built on top of the gossip layer, and will allow us to search for arbitrary objects on the network.
+- `gossip:<kind>`
+  - Payload: `msg_id + message_payload`
+    - `msg_id` - 16-byte random identifier of the message
+    - `message_payload` - the actual payload of the message
 
-The search consists of two parts: a query and a response. The nodes in a network can send a `search:query` message to all of their peers, asking if they have a specific object. The nodes that have the object should respond with a `search:response` message.
+## Part 3: Mempool
 
-Similarly to messaging, we can search for multiple kinds of objects, each identified with its own `kind`. For each kind, we will define what the query and response payloads should look like. Here we will have two different kinds of registrations: a query handler (that returns the searched object if we have it) and a response handler (that will handle responses to a particular query). Query handlers are registered on the Search object directly, while response handlers are registered along with the query.
+### Introduction
 
-Registering a response handler is optional, and by default unsolicited responses will be ignored.
+The mempool is a component of the blockchain that is responsible for collecting and managing transactions before they are included in a block. This includes:
+* Sending and receiving transactions from the network
+* Storing transactions in a local pool
+* Providing transactions to the block builder when requested
+* Evicting old transactions from the pool (e.g., transactions that have been in the pool for too long, and will likely never be included in a block)
 
-```python
-def _handle_object_query(query: Any) -> Any:
-  # This function should return the object if we have it, or None if we don't.
-  return None
+In this part, you will implement a simple mempool that will allow nodes to collect transactions from the network, and provide them to the block builder.
 
-search = Search(gossip)
-search.register('object', _handle_object_query)
-```
+### Your task
 
-We can also search for individual objects, and register a handler for the response to that specific query:
+In the file [mempool.py](bcws/blockchain.py) you will find a skeleton of a `Mempool` class. This class should implement the following methods:
 
-```python
-def _handle_object_response(response: Any) -> bool:
-  # This function should handle the response to the query.
-  # Return `True` if we want to stop searching.
-  pass
+- `__init__`: A constructor that initializes the mempool with the given parameters. You are given the following:
+  - `gossip` - instance of the gossip layer to use for receiving transactions
+- `start`: Starts any background tasks needed for the mempool.
+- `stop`: Stops all background tasks.
+- `announce_transaction`: Announces a new transaction to the network, and adds it to the mempool.
+- `get_transactions`: Returns a list of all transactions in the mempool.
+- `evict_transaction`: Evicts a transaction from the mempool (either because it was included in a block, or because it is deemed invalid).
 
-search.search_for('object', 'some_query', _handle_object_response)
-```
+Keep in mind that the mempool should maintain a list of transactions, and should evict old transactions periodically to prevent the pool from growing indefinitely.
 
-### Gossip messages involved
+### Messages used
 
-We will use the follwing gossip messages:
+- Gossip kind: `bc:new_tx`
+  - Payload: serialized transaction
 
-* `search:query` - the sender is asking if the receiver has a specific object. Each query is identified with a unique ID, and the query. Payload: `[id: str, kind: str, query: Any]`.
-* `search:response` - the sender is responding to the query, saying that it has the object. Payload: `[id: str, data: Any]`.
+## Part 4: Block building and execution
 
-## Your task
+### Introduction
 
-In the file [search.py](bcws/search.py) you will find a skeleton of a `Search` class. This class should implement a simple search layer that will allow us to search for messages in the network.
+Execution is the core of the blockchain. It is responsible for applying the state transition function, which given a block and the current state of the blockchain, will return the new state of the blockchain.
 
-Your task is to implement this class. The class should have the following methods:
+Block building is a related component, which is responsible for producing a new block, given the state of the blockchain and the mempool (list of all transactions), by selecting valid transactions from the mempool, and creating a new block that can be added to the blockchain.
 
-* `__init__` - a constructor that should initialize the search layer. The arguments are:
-  * `gossip: Gossip` - a gossip layer that will be used to send and receive messages.
-* `start` - a method that should start the search layer in the background. In the background process, we should periodically time out queries we sent more than `query_timeout` seconds ago.
-* `register` - a method that should register a query handler for a specific kind of object. The arguments are:
-  * `kind: str` - the kind of object we are searching for.
-  * `handler: (Any) -> Any` - a function that should return the object if we have it, or `None` if we don't.
-* `search_for` - a method that should send a query to the entire network, asking if anyone has the object. The arguments are:
-  * `kind: str` - the kind of object we are searching for.
-  * `query: Any` - the query. Exact format depends on the kind.
-  * `handler: (Any) -> bool` - a function that should handle the response to the query. If it returns `True`, the search will stop, and the handler will be removed. Otherwise, this is not the exact object we were searching for, and we should continue searching.
-  * `timeout` - the timeout for the search in seconds. When we reach this timeout, we should stop searching regardless of the results, and invoke `handler(None)` to let the caller know that we didn't find the object.
+### Your task
 
-# Part 6: Blockchain
+In the file [blockchain.py](bcws/blockchain.py) you will find a skeleton of the `Blockchain` class. This class should implement the following methods:
 
-## Introduction
+- `build_block`: Given the current state of the blockchain and the mempool, builds a new block that can be added to the blockchain. Arguments are:
+  - `state` - current state of the blockchain, which is discarded after building the block.
+  - `coinbase` - address to send the block reward to (will be the miner's address)
+  - `mempool` - instance of the mempool to get transactions from
+  - returns the new block (even if empty)
 
-In this part we will build a simple blockchain layer that will allow us to store and share blocks between nodes. The blockchain layer will be built on top of the search and gossip layers, and will allow us to store and retrieve blocks from the network.
+- `apply_block`: Given a block and the current state of the blockchain, validates and applies the block to the state. Arguments are:
+  - `state` - current state of the blockchain, which *should be modified*.
+  - `block` - block to apply
+  - returns `True` if the block is valid and was applied successfully, `False` otherwise (if `False`, the state modications are discarded)
 
-The blockchain we will be making is very simple. Each block contains:
-* The hash of the previous block.
-* A `nonce` that is used in POW. The hash of the block has to start with `difficulty` number of zeros, and changing the `nonce` is used to achieve that.
-* The block `number`, which must be increasing.
-* The `miner` address that will receive the block reward.
-* A list of transactions. Each transaction contains:
-  * A sender address.
-  * A receiver address.
-  * The amount of money sent.
-  * The sender's `nonce` to prevent replay attacks.
-  * The sender's signature to prove that the transaction is valid.
+Make sure to validate the block before applying it, including:
+* checking the block's hash meets the difficulty requirement
+* checking the block's parent is the current tip of the chain
+* checking all transactions in the block are valid (e.g., no double spends, sufficient balance, etc.)
 
-The state of the blockchain is a simple dictionary that maps addresses to their balances and nonces. The state is updated with each block, and the transactions are validated against the state.
+If a block is invalid, the state can be left in any state, as the caller will discard it.
 
-### The addresses and signatures
+# Appendix
 
-Each account is identified by an address, which is a public key. Each transaction is signed by the sender's private key, and the signature is used to verify the transaction. You can see the implementations of these functions in the [crypto.py](bcws/crypto.py) file.
+This section contains additional information that is not directly related to the tasks, but is intended for those who want to dive deeper into the implementation.
 
-### The transactions
+## Message formats
 
-Each transaction is a simple transfer of money from one account to another. The sender has to have enough money to send, and the transaction has to be signed by the sender's private key. The sender's nonce is used to prevent replay attacks, and the sender's balance and nonce are updated with each transaction.
+### Networking layer
 
-The signature is an ECDSA signature over the transaction data. The data is the concatenation of the sender's address, receiver's address, amount, and nonce. The signature is then verified with the sender's public key.
+Networking layer is implemented in the `network.py` file, and is based on a simple event-driven architecture. The `TcpServer` class is responsible for managing TCP connections, and allows registering event handlers for different events.
 
-You can see the implementations of these functions in the `Transaction` class in [blockchain.py](bcws/blockchain.py) file.
+All messages sent via the networking layer are prefixed with a 4-byte length field, indicating the length of the message, followed by the message payload.
 
-## Your task
+### Messaging layer
 
-Your task is to implement the two core functionalities of the blockchain:
+Messaging layer is implemented in the `messaging.py` file, and is built on top of the networking layer. The `Messaging` class is responsible for sending and receiving messages, and allows registering message handlers for different message kinds.
 
-### The state transition function
+Messages sent via the messaging layer have the following format:
+- 1-byte message type
+  - `0x00` - regular message
+  - `0x01` - request that expects a response
+  - `0x02` - response
+- 4-byte message ID
+- zero-terminated message kind string
+- message payload
 
-The state transition function is a function that takes the current state of the blockchain, a block, and returns the new state of the blockchain, or raises an exception if the block is invalid.
+### Blockchain types
 
-The state transition function should:
+All blockchain-related types are defined in the `blockchain_types.py` file. They are sent over the network in plain-text (in real systems, you would want to use a more efficient serialization format, such as Protocol Buffers or RLP).
 
-* Validate the block has the correct `number` and `previous_hash`.
-* Validate the block has the correct `nonce` and `difficulty`.
-* Validate and execute all transactions in the block:
-  * Check if the sender has enough money to send.
-  * Check if the sender's `nonce` is correct.
-  * Check if the sender's signature is correct.
-  * Update the sender's and receiver's balances and nonces.
-* Add the `BLOCK_REWARD` amount of money to the miner's balance.
-
-### The block building function
-
-The block building function is a function that takes the current state of the blockchain, a _mempool_ of all known transactions, and returns a new block that contains (some of) the transactions, contains the correct `number`, `previous_hash`, `nonce`, and `miner`, and has the correct `difficulty`.
-
-The block building function should:
-
-* Select up to `MAX_TRANSACTIONS` transactions from the list of all known transactions. These transactions must be valid:
-  * The sender has enough money to send.
-  * The sender's `nonce` is correct.
-  * The sender's signature is correct.
-* The blocks `miner` should be your address, to receive the block reward.
-* The blocks `number` should be the previous block's `number` + 1.
-* The blocks `previous_hash` should be the hash of the previous block.
-* The blocks `nonce` should be such that the hash of the block has `difficulty` number of leading zeros.
-
-In the file [blockchain.py](bcws/blockchain.py) you will find a skeleton of a `Blockchain` class. This class should implement a simple blockchain layer that will allow us to store and retrieve blocks from the network. Your task is to implement the `state_transition` and `build_block` methods.
-
-## Blockchain internals
-
-Here we give a short overview of the rest of the blockchain infrastructure, that is provided already. You can take a look at it, and see how it works, but you don't have to modify it.
-
-You can see the implementations of the following components in the [blockchain.py](bcws/blockchain.py) file.
-
-### Addresses, transactions, and blocks
-
-All addresses in our blockchain are raw ECDSA points, serialized in their compressed form (33 bytes long). In real blockchains, the addresses are usually hashes of the public keys, and are truncated. In our blockchain, we use the public keys directly.
-
-The transactions are simple transfers of money from one address to another. Each transaction is signed by the sender's private key, and the signature is used to verify the transaction. The sender's nonce is used to prevent replay attacks. The transactions are serialized in a simple string form:
+Transactions are represented as comma-separated strings in the following format:
 
 ```
-sender_address,receiver_address,nonce,amount,signature
+sender,recipient,nonce,amount,signature
 ```
 
-Addresses are hex encided, nonce and amount are in decimal, and `signature` is the hex encoded signature over the rest of the data.
+- `sender` - hex-encoded public key of the sender
+- `recipient` - hex-encoded public key of the recipient
+- `nonce` - integer nonce of the transaction
+- `amount` - integer amount to transfer
+- `signature_hex` - hex-encoded signature of the transaction (signature is over the string `sender,recipient,nonce,amount`)
 
-The blocks are simple containers for the transactions. Real blockchains would only contain the has of all transactions in the block header, but we store the transactions directly in the block. The blocks are serialized in a simple string form:
+Blocks are represented as colon-separated strings in the following format:
 
 ```
-number:nonce:parent_hash:coinbase:tx1:tx2:...:txn
+number:nonce:parent_hash:coinbase:tx1:tx2:...:txN
 ```
 
-The `number` is the block number, `nonce` is the proof of work nonce, `parent_hash` is the hash of the previous block, `coinbase` is the address of the miner, and `tx1`, `tx2`, ..., `txn` are the transactions in the block.
+- `number` - integer block number (genesis block is 0)
+- `nonce` - integer nonce of the block (used for proof-of-work)
+- `parent_hash` - hex-encoded hash of the parent block
+- `coinbase` - hex-encoded public key of the miner (receives the block reward)
+- `tx1`, `tx2`, ..., `txN` - list of transactions included in the block (serialized as described above)
 
-### State manager
+Block hash is computed as the SHA-256 hash of the block string (as described above).
 
-The state manager handles serialization and deserialization of the blockchain state. Complete state for each block is stored in a separate file. A more optimized version would store only the changes between blocks.
+## Blockchain state transition function
 
-### Mempool
+- Block number MUST be parent block number + 1.
+- Block parent hash MUST match the hash of the previous block.
+- Block hash MUST meet the difficulty requirements, i.e. first `DIFFICULTY` hex digits of the block hash MUST be zero.
+- Block must have between 0 and `MAX_TRANSACTIONS_PER_BLOCK` transactions.
+- For each transaction in the block:
+  - Transaction signature MUST be valid.
+  - Sender account MUST have sufficient balance.
+  - Transaction nonce MUST match the sender's account nonce.
+  - Deduct the amount from the sender's balance, and increment the sender's nonce.
+  - If the recipient account does not exist, create it with a balance of 0 and nonce of 0 before adding the amount.
+  - Add the amount to the recipient's balance.
+- Finally `BLOCK_REWARD` is added to the coinbase account's balance.
 
-The mempool is a component that collects all the transactions that are not yet in the blockchain. The transactions are added to the mempool when they are received, and removed when they are included in a block, time out, or are shown to be invalid.
-
-### Fork manager
-
-The fork manages is a component that is responsible for collecting all the blocks produced on the network, finding out about any missing intermediary blocks, and selecting the longest confirmed chain in case of a fork.
-
-### Chain canonicalizer
-
-The chain canonicalizer is a component that is responsible for producing the "canonical chain" from the blocks produced by the fork manager. This component is responsible for deriving the state of the blockchain from the blocks, rewinding in case of reorgs, and applying the blocks to the state.
-
-### Blockchain Node
-
-The blockchain node is a component that ties all of the components together. It is responsible for starting all of the components, and handling the communication between them.
-
-It is also responsible for orchestrating the block building process, and sending the blocks to the network.
-
-## Conclusion
-
-Congratulations! You have successfully built a simple blockchain from scratch. You have learned how to build a simple networking layer, a peering layer, a gossip layer, a search layer, and a blockchain layer. You have learned how to build more complex systems on top of simpler ones, and how to use abstractions to build more complex systems.
-
-If you want to, you can take a look at the systems that were provided, how they work, and how they are used. You can also try to build more complex systems on top of these, modify the rules of the blockchain, or build a more complex one.
-
-Good luck, and have fun building!
+### Blockchain parameters
+- `BLOCK_REWARD = 10_000` units
+- `DIFFICULTY = 7` leading zero hex digits
+- `MAX_TRANSACTIONS_PER_BLOCK = 10`
