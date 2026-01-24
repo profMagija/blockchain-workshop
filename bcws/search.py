@@ -1,116 +1,108 @@
-import typing as t
+import os
+import threading
+import time
+from typing import Callable
 
 from .gossip import Gossip
+from .p2p import P2PPeer
+from .utils import run_in_background, safe_invoke
 
-# ---------8<---------
-import time
-from .gossip import GossipMessage
-from .utils import generate_id, run_in_background, log
+_SEARCH_TIMEOUT = 30
 
-# ---------8<---------
-
-SearchResultHandler = t.Callable[[t.Any], bool | None]
-Searcher = t.Callable[[t.Any], t.Any]
+type SearchHandler = Callable[[bytes], bytes | None]
+type SearchResultHandler = Callable[[bytes | None], bool]
 
 
 class Search:
     def __init__(self, gossip: Gossip):
         self.gossip = gossip
-        # <<raise NotImplementedError("Search.__init__")
-        # ---------8<---------
-        self._searchers: dict[str, Searcher] = {}
-        self._queries: dict[str, tuple[float, SearchResultHandler]] = {}
+        self.p2p = gossip.p2p
 
-        self.gossip.register("search:query", self._handle_query)
-        self.gossip.register("search:response", self._handle_response)
-        # ---------8<---------
+        self._search_handlers: dict[str, SearchHandler] = {}
+        self._queries: dict[
+            bytes, tuple[threading.Lock, SearchResultHandler, float]
+        ] = {}
+        self._return_paths: dict[bytes, tuple[P2PPeer, float]] = {}
 
     def start(self) -> None:
-        """
-        Start the search service in the background.
-        """
-        # <<raise NotImplementedError("Search.start")
-        # ---------8<---------
-        run_in_background(self._cleanup_loop)
-        # ---------8<---------
+        self._stopped = threading.Event()
+        self._timeout_loop_thread = run_in_background(self._timeout_loop)
 
-    def register(self, kind: str, searcher: Searcher) -> None:
-        """
-        Register a searcher for a specific kind of search.
+    def stop(self) -> None:
+        pass
 
-        A searcher is a function that takes an identifier and returns the
-        result, or None if not found.
+    def register(self, kind: str, handler: SearchHandler):
+        if kind in self._search_handlers:
+            raise ValueError(f"Search handler for kind '{kind}' is already registered.")
 
-        Args:
-            kind (str): The kind of search to register.
-            searcher (Searcher): The searcher function.
+        self._search_handlers[kind] = handler
 
-        Raises:
-            ValueError: If a searcher for the kind is already registered.
-        """
-        # <<raise NotImplementedError("Search.register")
-        # ---------8<---------
-        if kind in self._searchers:
-            raise ValueError(f"Searcher for {kind} already registered")
-        self._searchers[kind] = searcher
-        # ---------8<---------
+        _gossip_msg = "search:" + kind
+        _search_response_msg = "search_response:" + kind
 
-    def search_for(
+        def _gossip_handler(peer: P2PPeer, payload: bytes):
+            search_id = payload[:16]
+            message_payload = payload[16:]
+
+            response = safe_invoke(handler, message_payload)
+            if response is not None:
+                self.p2p.send_message(peer, _search_response_msg, search_id + response)
+                return False
+            else:
+                self._return_paths[search_id] = (peer, time.time())
+                return True
+
+        def _response_handler(peer: P2PPeer, payload: bytes):
+            search_id = payload[:16]
+            message_payload = payload[16:]
+
+            if search_id in self._queries:
+                l, result_handler, _ = self._queries[search_id]
+                with l:
+                    if search_id not in self._queries:
+                        return
+                    if safe_invoke(result_handler, message_payload):
+                        self._queries.pop(search_id, None)
+            elif search_id in self._return_paths:
+                peer2, _ = self._return_paths.pop(search_id, (None, 0.0))
+                if peer2 is not None:
+                    self.p2p.send_message(peer2, _search_response_msg, message_payload)
+
+        self.gossip.register_handler(_gossip_msg, _gossip_handler)
+        self.p2p.register_handler(_search_response_msg, _response_handler)
+
+    def query(
         self,
         kind: str,
-        query: t.Any,
-        handler: SearchResultHandler,
-        timeout: int = 60,
+        payload: bytes,
+        result_handler: SearchResultHandler,
     ) -> None:
-        """
-        Search for an identifier of a specific kind. The handler will be called
-        with the result when found, or None if not found.
-
-        If the handler returns True, the search will be stopped, and not called again.
+        """Submits a query to the network.
 
         Args:
-            kind (str): The kind of search to perform.
-            query (Any): The query for the search. The type is specific to the search kind.
-            handler (SearchResultHandler): The handler to call with the result.
-            timeout (int, optional): The timeout in seconds. Defaults to 60.
+            kind (str): The kind of data being searched for.
+            payload (bytes): The payload of the search query.
+            result_handler (SearchResultHandler): The handler for processing search results. If the handler returns True, the search is considered complete.
         """
-        # <<raise NotImplementedError("Search.search_for")
-        # ---------8<---------
-        query_id = generate_id("q")
-        log("sch", f"search {query_id} for {kind}: {query}")
-        self._queries[query_id] = (time.time() + timeout, handler)
-        self.gossip.broadcast(GossipMessage("search:query", [query_id, kind, query]))
+        msg_id = _make_msg_id()
+        self._queries[msg_id] = (threading.Lock(), result_handler, time.time())
+        self.gossip.broadcast("search:" + kind, msg_id + payload)
 
-    def _handle_query(self, message: GossipMessage):
-        query_id, kind, query = message.data
-        searcher = self._searchers.get(kind)
-        if searcher is None:
-            log("err", f"no searcher found for {kind}")
-            return
+    def _timeout_loop(self) -> None:
+        while not self._stopped.is_set():
+            for k, (l, rh, ts) in list(self._queries.items()):
+                if time.time() - ts > _SEARCH_TIMEOUT:
+                    with l:
+                        if k not in self._queries:
+                            continue
+                        self._queries.pop(k, None)
+                        safe_invoke(rh, None)
+            for k, (_, ts) in list(self._return_paths.items()):
+                if time.time() - ts > _SEARCH_TIMEOUT:
+                    self._return_paths.pop(k, None)
 
-        result = searcher(query)
-        log("sch", f"search {query_id} for {kind}: found {result}")
-        if result is None:
-            return
+            self._stopped.wait(5)
 
-        self.gossip.broadcast(GossipMessage("search:response", [query_id, result]))
 
-    def _handle_response(self, message: GossipMessage):
-        query_id, result = message.data
-
-        _, handler = self._queries.get(query_id, (0, None))
-        if handler is None:
-            return
-
-        log("sch", f"received result for {query_id}: {result}")
-
-        if handler(result):
-            log("sch", f"handler for {query_id} returned True, stopping search")
-            del self._queries[query_id]
-
-    def _cleanup_loop(self):
-        for key, (timeout, _) in list(self._queries.items()):
-            if timeout < time.time():
-                _, handler = self._queries.pop(key)
-                handler(None)
-                log("sch", f"query {key} timed out")
+def _make_msg_id() -> bytes:
+    return os.urandom(16)

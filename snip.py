@@ -15,7 +15,7 @@ def snip(source: str, target: str, ignore: tuple[str, ...]):
 
 
 def _snip_element(source: str, target: str, ignore: tuple[str, ...]):
-    if any(os.path.samefile(ig, source) for ig in ignore):
+    if any(os.path.samefile(ig, source) for ig in ignore if os.path.exists(ig)):
         return
 
     if os.path.isdir(source):

@@ -1,44 +1,61 @@
-import os
+import logging
+from typing import Callable
 import threading
-import typing as t
-
-_enable_all_logs = False
-_ENABLED_LOGS: set[str] = {"err", "log"}
+import socket
 
 
-def enable_log(kind: str):
-    global _enable_all_logs
+class EventHandler[*T]:
+    def __init__(self):
+        self.listeners: list[Callable[[*T], None]] = []
 
-    if kind == "":
-        return
+    def register(self, listener: Callable[[*T], None]) -> None:
+        self.listeners.append(listener)
 
-    if kind == "all":
-        _enable_all_logs = True
+    def unregister(self, listener: Callable[[*T], None]) -> None:
+        self.listeners.remove(listener)
 
-    _ENABLED_LOGS.add(kind)
+    def notify(self, *args: *T) -> None:
+        for listener in self.listeners:
+            safe_invoke(listener, *args)
 
 
-_P = t.ParamSpec("_P")
-
-
-def run_in_background(func: t.Callable[_P, t.Any], *args: _P.args, **kwargs: _P.kwargs):
-    thread = threading.Thread(target=func, args=args, kwargs=kwargs)
-    thread.daemon = True
+def run_in_background[**P](
+    task: Callable[P, None],
+    *args: P.args,
+    **kwargs: P.kwargs,
+) -> threading.Thread:
+    thread = run_in_background_deferred(task, *args, **kwargs)
     thread.start()
+    return thread
 
 
-def generate_id(kind: str):
-    return f"{kind}:{os.urandom(8).hex()}"
+def run_in_background_deferred[**P](
+    task: Callable[P, None],
+    *args: P.args,
+    **kwargs: P.kwargs,
+) -> threading.Thread:
+    thread = threading.Thread(target=task, args=args, kwargs=kwargs, daemon=True)
+    return thread
 
 
-def log(kind: str, *args: t.Any):
-    if not _enable_all_logs and kind not in _ENABLED_LOGS:
-        return
+def recv_exact(sock: socket.socket, n: int) -> bytes | None:
+    """Receive exactly n bytes from the socket."""
+    data = bytearray()
+    while len(data) < n:
+        try:
+            packet = sock.recv(n - len(data))
+        except Exception:
+            return None
+        if not packet:
+            return None
+        data.extend(packet)
+    return bytes(data)
 
-    leader = "\x1b[1;32m"
-    if kind == "err":
-        leader = "\x1b[1;31m"
-    elif kind == "log":
-        leader = "\x1b[1;34m"
 
-    print(f"{leader}[{kind}]\x1b[0m", *args)
+def safe_invoke[**P, T](
+    func: Callable[P, T], *args: P.args, **kwargs: P.kwargs
+) -> T | None:
+    try:
+        return func(*args, **kwargs)
+    except Exception:
+        logging.exception("Error invoking function %s", func, stack_info=True)

@@ -1,222 +1,241 @@
 import json
-import click
+import logging
+import random
 import time
 
-from .utils import enable_log, log
+import click
+
+from .blockchain import BlockchainNode, Transaction
+from .crypto import PrivateKey
+from .gossip import Gossip
+from .messaging import Messaging
+from .network import TcpConnection, TcpServer, parse_address
+from .p2p import P2PNode, P2PPeer, network_discovery_loop
+from .search import Search
+from .storage import StorageMaster
+from .utils import run_in_background
+
+logging.basicConfig(level=logging.INFO)
+
+_host: str
+_port: int
+_peers: list[str]
 
 
 @click.group()
-@click.option("--log", "-L", default="")
-def main(log: str):
-    for item in log.split(","):
-        enable_log(item)
+@click.option("--host", default="127.0.0.1", help="Host to listen on")
+@click.option("--port", default=15151, help="Port to listen on")
+@click.option(
+    "--peer", multiple=True, help="Peer address to connect to (format: host:port)"
+)
+def main(host: str, port: int, peer: list[str]):
+    global _host, _port, _peers
+    _host = host
+    _port = port
+    _peers = peer
+
+
+def _add_node_logging(node: TcpServer) -> None:
+    def on_connect(conn: TcpConnection, initiated: bool) -> None:
+        logging.info("Connected to %s (initiated=%s)", conn.addr, initiated)
+
+    def on_message(conn: TcpConnection, message: bytes) -> None:
+        logging.info("Received message from %s: %s", conn.addr, message)
+
+    def on_disconnect(conn: TcpConnection, initiated: bool) -> None:
+        logging.info("Disconnected from %s (initiated=%s)", conn.addr, initiated)
+
+    node.on_connect.register(on_connect)
+    node.on_message.register(on_message)
+    node.on_disconnect.register(on_disconnect)
+
+
+def _connect_to_peers(node: TcpServer, peer_addresses: list[str]) -> None:
+    for p in peer_addresses:
+        host, port_str = p.split(":")
+        addr = (host, int(port_str))
+        node.connect(addr)
 
 
 @main.command()
-@click.option("--port", "-p", default=12345, help="The port to listen on.")
-@click.option(
-    "--peer",
-    "-P",
-    help="The initial peer to connect to.",
-    multiple=True,
-    required=True,
-)
-def messaging(port: int, peer: list[str]):
-    from .network import PrintingHandler, UDPNode, UDPPeer
+def networking(port: int, peer: list[str]):
 
-    # initialization
-    udp = UDPNode(port, PrintingHandler())
+    node = TcpServer((_host, port))
+    _add_node_logging(node)
 
-    # start
-    udp.start()
+    node.start()
+    logging.info("Node started on port %d", port)
 
-    while True:
-        message = input("Enter message: ")
-        udp.send(UDPPeer(peer[0]), message.encode())
+    _connect_to_peers(node, peer)
 
+    try:
+        while True:
+            message = input()
+            if message.lower() == "exit":
+                break
 
-@main.command()
-@click.option("--port", "-p", default=12345, help="The port to listen on.")
-@click.option(
-    "--peer",
-    "-P",
-    help="The initial peer to connect to.",
-    multiple=True,
-)
-def peering(port: int, peer: list[str]):
-    from .messaging import UDPMessage, UDPMessaging, UDPPeer
-    from .peering import P2PNetwork
+            for conn in node.conns.values():
+                conn.send_message(message.encode())
+    except KeyboardInterrupt:
+        logging.info("Shutting down node...")
 
-    # initialization
-    udpMessaging = UDPMessaging(port)
-    network = P2PNetwork(udpMessaging)
-
-    # handler registration
-    def _hello(message: UDPMessage, sender: UDPPeer):
-        log("log", sender, message.data)
-
-    udpMessaging.register("hello", _hello)
-
-    # start & joining
-    network.start()
-    for p in peer:
-        network.announce_to(p)
-
-    while True:
-        message = input("Enter message: ")
-        network.broadcast(UDPMessage("hello", message))
+    node.stop()
 
 
 @main.command()
-@click.option("--port", "-p", default=12345, help="The port to listen on.")
-@click.option(
-    "--peer",
-    "-P",
-    help="The initial peer to connect to.",
-    multiple=True,
-)
-@click.option("--nd", is_flag=True, help="Enable network discovery.")
-def gossip(port: int, peer: list[str], nd: bool):
-    from .messaging import UDPMessaging
-    from .peering import P2PNetwork
-    from .gossip import Gossip, GossipMessage
+def messaging():
+    node = TcpServer((_host, _port))
+    messaging = Messaging(node)
 
-    # initialization
-    udpMessaging = UDPMessaging(port)
-    network = P2PNetwork(udpMessaging)
-    gossip = Gossip(udpMessaging, network)
+    # _add_node_logging(node)
 
-    # handler registration
-    def _print_msg(message: GossipMessage):
-        sender, text, _ = message.data
-        log("log", "message:", sender, ":", text)
+    def on_message(conn: TcpConnection, payload: bytes) -> bytes | None:
+        logging.info("Received message from %s: %s", conn.addr, payload)
+        response = b"Echo: " + payload
+        return response
 
-    gossip.register("msg", _print_msg)
-
-    # start & joining
-    network.start()
-    network.start_network_discovery(nd)
-
-    for p in peer:
-        network.announce_to(p)
-
-    # while True:
-    #     text = input("Enter message: ")
-    #     message = [network.my_id, text, time.time()]
-    #     gossip.broadcast(GossipMessage("msg", message))
-    time.sleep(1000)
-
-
-@main.command()
-@click.option("--port", "-p", default=12345, help="The port to listen on.")
-@click.option(
-    "--peer",
-    "-P",
-    help="The initial peer to connect to.",
-    multiple=True,
-)
-@click.option("--nd", is_flag=True, help="Enable network discovery.")
-def search(port: int, peer: list[str], nd: bool):
-    from .messaging import UDPMessaging
-    from .peering import P2PNetwork
-    from .gossip import Gossip
-    from .search import Search
-
-    udpMessaging = UDPMessaging(port)
-    network = P2PNetwork(udpMessaging)
-    gossip = Gossip(udpMessaging, network)
-    search = Search(gossip)
-
-    udpMessaging.start()
-    network.start()
-    network.start_network_discovery(nd)
-    gossip.start()
-    search.start()
-
-    for p in peer:
-        network.announce_to(p)
-
-    my_items: dict[str, str] = {}
-
-    def _item_searcher(query: str):
-        if query in my_items:
-            return my_items[query]
-
-    search.register("item", _item_searcher)
-
-    while True:
-        action = input("[s]earch, [p]rovide, [q]uit: ").lower()
-        if action == "s":
-            query = input("Enter query: ")
-
-            def _result_handler(message: str):
-                print(f"Received result for '{query}':", message)
-
-            search.search_for("item", query, _result_handler)
-        elif action == "p":
-            item = input("Enter item: ")
-            value = input("Enter value: ")
-            my_items[item] = value
-        elif action == "q":
-            break
+    def on_response(conn: TcpConnection, payload: bytes | None) -> None:
+        if payload is None:
+            logging.info("No response from %s", conn.addr)
         else:
-            print("Invalid action. Try again.")
+            logging.info("Received response from %s: %s", conn.addr, payload)
+
+    messaging.register_handler("echo", on_message)
+
+    node.start()
+    messaging.start()
+
+    logging.info("Messaging node started on port %d", _port)
+
+    _connect_to_peers(node, _peers)
+
+    try:
+        while True:
+            message = "this is a test message"
+            for conn in node.conns.values():
+                messaging.send_message(conn, "echo", message.encode(), on_response)
+            time.sleep(5)
+    except KeyboardInterrupt:
+        logging.info("Shutting down messaging node...")
+
+    node.stop()
 
 
 @main.command()
-@click.option("--port", "-p", default=12345, help="The port to listen on.")
-@click.option(
-    "--peer",
-    "-P",
-    help="The initial peer to connect to.",
-    multiple=True,
-)
+@click.option("--nd", is_flag=True, help="Enable network discovery background task")
+def p2p(nd: bool):
+    bootstrap_nodes = [parse_address(p) for p in _peers]
+
+    node = TcpServer((_host, _port))
+    messaging = Messaging(node)
+    p2p_node = P2PNode(node, messaging, 4, bootstrap_nodes=bootstrap_nodes)
+
+    node.start()
+    messaging.start()
+    p2p_node.start()
+
+    if nd:
+        run_in_background(network_discovery_loop, p2p_node)
+
+    for p in _peers:
+        addr = parse_address(p)
+        p2p_node.connect_to_peer(addr)
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logging.info("Shutting down P2P node...")
+
+    node.stop()
+
+
+@main.command()
+@click.option("--nd", is_flag=True, help="Enable network discovery background task")
+def gossip(nd: bool):
+    bootstrap_nodes = [parse_address(p) for p in _peers]
+
+    node = TcpServer((_host, _port))
+    messaging = Messaging(node)
+    p2p_node = P2PNode(node, messaging, 4, bootstrap_nodes=bootstrap_nodes)
+    gossip = Gossip(p2p_node)
+
+    def _print_message(peer: P2PPeer, payload: bytes):
+        sender, message = payload.decode().split("\0", 1)
+        print(f"[{sender}] {message}")
+        return True
+
+    gossip.register_handler("chat", _print_message)
+
+    node.start()
+    messaging.start()
+    p2p_node.start()
+    gossip.start()
+
+    if nd:
+        run_in_background(network_discovery_loop, p2p_node)
+
+    for p in _peers:
+        addr = parse_address(p)
+        p2p_node.connect_to_peer(addr)
+
+    try:
+        while True:
+            msg = "hello world"
+            sender = f"{_host}:{_port}"
+            payload = f"{sender}\0{msg}".encode()
+            gossip.broadcast("chat", payload)
+
+            time.sleep(5 * random.random())
+
+    except KeyboardInterrupt:
+        logging.info("Shutting down Gossip node...")
+
+    gossip.stop()
+    node.stop()
+
+
+@main.command()
 @click.option("--nd", is_flag=True, help="Enable network discovery.")
 @click.option("--ds", is_flag=True, help="Dump blockchain state periodically.")
-@click.option("--state-dir", default=".stor")
-def blockchain(port: int, peer: list[str], nd: bool, ds: bool, state_dir: str):
-    from .messaging import UDPMessaging
-    from .peering import P2PNetwork
-    from .gossip import Gossip
-    from .search import Search
-    from .blockchain import BlockchainNode, Transaction
-    from .storage import Storage, StorageMaster
-    from .crypto import PrivateKey
-    from .utils import run_in_background
+@click.option(
+    "--state-dir", default=":memory:", help="Directory to store blockchain state."
+)
+def blockchain(nd: bool, ds: bool, state_dir: str):
 
-    udpMessaging = UDPMessaging(port)
-    network = P2PNetwork(udpMessaging)
-    gossip = Gossip(udpMessaging, network)
+    net = TcpServer((_host, _port))
+    msg = Messaging(net)
+    network = P2PNode(net, msg, bootstrap_nodes=[parse_address(p) for p in _peers])
+    gossip = Gossip(network)
     search = Search(gossip)
     sm = StorageMaster(state_dir)
     blockchain_node = BlockchainNode(sm, gossip, search)
 
-    pk_storage = Storage(sm, "privkey")
-    pk_str = pk_storage.load("privkey")
-    if pk_str is None:
+    pk_storage = sm.get_storage("privkey")
+    pk = pk_storage.load("privkey")
+    if pk is None:
         pk = PrivateKey.generate()
-        pk_storage.save("privkey", pk.to_bytes().hex())
+        pk_storage.save("privkey", pk.to_bytes())
     else:
-        pk = PrivateKey.from_bytes(bytes.fromhex(pk_str))
+        pk = PrivateKey.from_bytes(pk)
 
     my_address = pk.to_public().to_bytes()
 
     blockchain_node.coinbase = my_address
 
-    udpMessaging.start()
+    net.start()
+    msg.start()
     network.start()
-    network.start_network_discovery(nd)
     gossip.start()
     search.start()
     blockchain_node.start()
 
-    for p in peer:
-        network.announce_to(p)
+    if nd:
+        run_in_background(network_discovery_loop, network)
 
     if ds:
 
-        @run_in_background
-        def _():
+        def _do_state_dump():
             try:
                 while True:
                     transactions = [
@@ -239,7 +258,12 @@ def blockchain(port: int, peer: list[str], nd: bool, ds: bool, state_dir: str):
                         )
                     time.sleep(1)
             except Exception as e:
-                log("err", e)
+                logging.exception("Error in state dump thread: %s", e)
+
+        run_in_background(_do_state_dump)
+
+    while True:
+        time.sleep(10)
 
     while True:
         action = input("[s]end, [b]alance, [n]once, [l]atest, [q]uit: ").lower()
@@ -282,5 +306,4 @@ def blockchain(port: int, peer: list[str], nd: bool, ds: bool, state_dir: str):
             print("Invalid action. Try again.")
 
 
-if __name__ == "__main__":
-    main()
+main()

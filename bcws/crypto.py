@@ -14,7 +14,7 @@ class PrivateKey:
     def from_bytes(cls, data: bytes):
         return cls(ecdsa.SigningKey.from_string(data))
 
-    def to_bytes(self):
+    def to_bytes(self) -> bytes:
         return self._key.to_string()
 
     def to_public(self):

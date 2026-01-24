@@ -1,86 +1,142 @@
-import json
-import traceback
-import typing as t
+import threading
+import time
+from typing import Callable
 
-from .network import UDPHandler, UDPNode, UDPPeer
-from .utils import log
+from .utils import run_in_background, safe_invoke
+from .network import TcpServer, TcpConnection
 
 
-class UDPMessage:
-    """
-    Represents a message in the network. A message has a kind, data, and an
-    optional sender. This is a higher-level abstraction on top of raw bytes.
-    """
+type MessageHandler = Callable[[TcpConnection, bytes], bytes | None]
+type MessageResponseHandler = Callable[[TcpConnection, bytes | None], None]
 
-    def __init__(self, kind: str, data: t.Any):
+DEFAULT_TIMEOUT = 10.0
+
+
+_MESSAGE_TYPE_STANDARD = 0
+_MESSAGE_TYPE_STANDARD_WITH_RESPONSE = 1
+_MESSAGE_TYPE_RESPONSE = 2
+
+
+class MessagingMessage:
+    def __init__(self, message_type: int, message_id: int, kind: str, payload: bytes):
+        self.message_type = message_type
+        self.message_id = message_id
         self.kind = kind
-        self.data = data
+        self.payload = payload
+
+    def serialize(self) -> bytes:
+        ba = bytearray()
+        ba.append(self.message_type)
+        ba.extend(self.message_id.to_bytes(4, byteorder="big"))
+        ba.extend(self.kind.encode("utf-8"))
+        ba.append(0)
+        ba.extend(self.payload)
+        return bytes(ba)
 
     @staticmethod
-    def from_bytes(content: bytes) -> "UDPMessage":
-        kind, data = json.loads(content)
-        return UDPMessage(kind, data)
+    def deserialize(data: bytes) -> "MessagingMessage":
+        message_type = data[0]
+        message_id = int.from_bytes(data[1:5], byteorder="big")
+        null_index = data.index(0, 5)
+        kind = data[5:null_index].decode("utf-8")
+        payload = data[null_index + 1 :]
+        return MessagingMessage(message_type, message_id, kind, payload)
 
-    def to_bytes(self) -> bytes:
-        return json.dumps([self.kind, self.data]).encode()
-
-
-MessageHandler = t.Callable[[UDPMessage, UDPPeer], None]
-
-
-class MessageDispatchHandler(UDPHandler):
-    """
-    A handler that dispatches messages to the appropriate handlers.
-    """
-
-    def __init__(self, dispatch: "UDPMessaging"):
-        self.dispatch = dispatch
-
-    def handle_receive(self, data: bytes, address: UDPPeer):
-        try:
-            message = UDPMessage.from_bytes(data)
-            self.dispatch.dispatch(message, address)
-        except:
-            traceback.print_exc()
+    def __repr__(self) -> str:
+        return f"MessagingMessage(type={self.message_type}, id={self.message_id}, kind={self.kind!r}, payload={self.payload!r})"
 
 
-class UDPMessaging:
-    """
-    A higher-level messaging system that builds on top of UDPNode. This class allows registering message handlers
-    """
+class Messaging:
+    def __init__(self, net: TcpServer):
+        net.on_message.register(self._handle_message)
 
-    def __init__(self, port: int):
-        """
-        Initializes the messaging system.
-
-        :param port: The port to listen on.
-        """
-        self.handler = MessageDispatchHandler(self)
-        self.udp = UDPNode(port, self.handler)
-
-        self.handlers: dict[str, MessageHandler] = {}
+        self._message_handlers: dict[str, MessageHandler] = {}
+        self._last_message_id = 0
+        self._response_handlers: dict[
+            tuple[TcpConnection, int], tuple[float, MessageResponseHandler]
+        ] = {}
 
     def start(self):
-        """Starts the underlying UDP node."""
-        self.udp.start()
+        self._stopped = threading.Event()
+        self._process_thread = run_in_background(self._process_timeouts)
 
-    def send(self, peer: UDPPeer, message: UDPMessage):
-        """Sends a message to a peer."""
-        self.udp.send(peer, message.to_bytes())
-        log("msg", f"send {peer}: {message.kind} {message.data!r}")
+    def stop(self):
+        self._stopped.set()
+        if self._process_thread is not threading.current_thread():
+            self._process_thread.join()
 
-    def register(self, kind: str, handler: MessageHandler):
-        """Registers a message handler for a specific message kind."""
-        if kind in self.handlers:
-            raise ValueError(f"handler for {kind} already registered")
+    def register_handler(self, kind: str, handler: MessageHandler):
+        if kind in self._message_handlers:
+            raise ValueError(f"Handler for kind '{kind}' is already registered")
+        self._message_handlers[kind] = handler
 
-        self.handlers[kind] = handler
-
-    def dispatch(self, message: UDPMessage, sender: UDPPeer):
-        """Dispatches a message to the appropriate handler."""
-        log("msg", f"recv {sender}: {message.kind} {message.data!r}")
-        handler = self.handlers.get(message.kind)
-        if handler is not None:
-            handler(message, sender)
+    def send_message(
+        self,
+        conn: TcpConnection,
+        kind: str,
+        payload: bytes,
+        response_handler: MessageResponseHandler | None = None,
+        response_timeout: float | None = None,
+    ) -> None:
+        message_id = self._next_message_id()
+        if response_handler is not None:
+            response_timeout = response_timeout or DEFAULT_TIMEOUT
+            expire_at = time.time() + response_timeout
+            self._response_handlers[(conn, message_id)] = (expire_at, response_handler)
+            message_type = _MESSAGE_TYPE_STANDARD_WITH_RESPONSE
         else:
-            log("err", f"no handler for {message.kind}")
+            message_type = _MESSAGE_TYPE_STANDARD
+
+        message = MessagingMessage(
+            message_type=message_type,
+            message_id=message_id,
+            kind=kind,
+            payload=payload,
+        )
+        conn.send_message(message.serialize())
+
+    def _handle_message(self, conn: TcpConnection, data: bytes) -> None:
+        message = MessagingMessage.deserialize(data)
+        if message.message_type == _MESSAGE_TYPE_RESPONSE:
+            return self._handle_response(conn, message)
+
+        handler = self._message_handlers.get(message.kind)
+        if handler is None:
+            return  # Unknown message kind; ignore
+
+        response_payload = handler(conn, message.payload)
+        if (
+            message.message_type == _MESSAGE_TYPE_STANDARD_WITH_RESPONSE
+            and response_payload is not None
+        ):
+            response_message = MessagingMessage(
+                message_type=_MESSAGE_TYPE_RESPONSE,
+                message_id=message.message_id,
+                kind="",
+                payload=response_payload,
+            )
+            conn.send_message(response_message.serialize())
+
+    def _handle_response(self, conn: TcpConnection, message: MessagingMessage) -> None:
+        key = (conn, message.message_id)
+        _, response_handler = self._response_handlers.pop(key, (0.0, None))
+        if response_handler is not None:
+            safe_invoke(response_handler, conn, message.payload)
+
+    def _next_message_id(self) -> int:
+        self._last_message_id += 1
+        return self._last_message_id
+
+    def _process_timeouts(self) -> None:
+        while not self._stopped.is_set():
+            now = time.time()
+            handlers_to_invoke: list[tuple[TcpConnection, MessageResponseHandler]] = []
+            for key, (expire_at, handler) in list(self._response_handlers.items()):
+                if now >= expire_at:
+                    handlers_to_invoke.append((key[0], handler))
+                    del self._response_handlers[key]
+
+            for peer, handler in handlers_to_invoke:
+                safe_invoke(handler, peer, None)
+
+            self._stopped.wait(1.0)

@@ -4,12 +4,15 @@ import json
 import time
 import hashlib
 import typing as t
+import logging
 
+
+from .crypto import PrivateKey, PublicKey
+from .gossip import Gossip
+from .p2p import P2PPeer
 from .search import Search
 from .storage import Storage, StorageMaster
-from .gossip import Gossip, GossipMessage
-from .crypto import PrivateKey, PublicKey
-from .utils import log, run_in_background
+from .utils import run_in_background
 
 _DIFFICULTY = 7
 _MAX_TRANSACTIONS_PER_BLOCK = 10
@@ -85,6 +88,9 @@ class Blockchain:
 
     def _apply_transaction(self, tx: Transaction, state: BlockchainState) -> bool:
         if not tx.validate_signature():
+            return False
+
+        if tx.amount < 0:
             return False
 
         state.balances.setdefault(tx.sender, 0)
@@ -241,7 +247,7 @@ class BlockchainState:
 
     def save_to_disk(self, blockstate_storage: Storage):
         data = self.to_json()
-        blockstate_storage.save(str(self.block_number), json.dumps(data))
+        blockstate_storage.save(str(self.block_number), json.dumps(data).encode())
 
     @classmethod
     def from_json(cls, data: dict[str, t.Any]):
@@ -251,7 +257,7 @@ class BlockchainState:
         state.nonces = {bytes.fromhex(k): v for k, v in data["nonces"].items()}
         return state
 
-    def to_json(self):
+    def to_json(self) -> dict[str, t.Any]:
         return {
             "block_number": self.block_number,
             "block_hash": self.block_hash.hex(),
@@ -273,38 +279,39 @@ class Mempool:
         self._transactions: dict[bytes, Transaction] = {}
         self._last_seen: dict[bytes, float] = {}
 
-        self.gossip.register("bc:new_tx", self._handle_new_tx)
+        self.gossip.register_handler("bc:new_tx", self._handle_new_tx)
 
     def start(self):
         run_in_background(self._cleanup_loop)
 
     def announce_transaction(self, tx: Transaction):
-        log("blc", "Announcing new transaction", tx)
-        self.gossip.broadcast(GossipMessage("bc:new_tx", tx.serialize()))
+        logging.info("Announcing new transaction %s", tx)
+        self.gossip.broadcast("bc:new_tx", tx.serialize().encode())
         self.add_transaction(tx)
 
     def get_transactions(self) -> list[Transaction]:
         return list(self._transactions.values())
 
     def evict_transaction(self, tx: Transaction) -> None:
-        log("blc", "Evicting transaction", tx)
+        logging.info("Evicting transaction %s", tx)
         self._transactions.pop(tx.hash(), None)
         self._last_seen.pop(tx.hash(), None)
 
     def add_transaction(self, tx: Transaction) -> None:
         if tx.hash() not in self._transactions:
-            log("blc", "Discovered new transaction", tx)
+            logging.info("Discovered new transaction %s", tx)
         self._transactions[tx.hash()] = tx
         self._last_seen[tx.hash()] = time.time()
 
-    def _handle_new_tx(self, message: GossipMessage):
-        tx = Transaction.deserialize(message.data)
+    def _handle_new_tx(self, peer: P2PPeer, message: bytes):
+        tx = Transaction.deserialize(message.decode())
 
         if not tx.validate_signature():
-            log("blc", "Invalid transaction signature:", tx)
-            return
+            logging.info("Invalid transaction signature: %s", tx)
+            return False
 
         self.add_transaction(tx)
+        return True
 
     def _cleanup_loop(self):
         now = time.time()
@@ -326,42 +333,45 @@ class ForkManager:
 
         self.highest_block: Block | None = None
 
-        self.gossip.register("bc:new_block", self._handle_new_block)
+        self.gossip.register_handler("bc:new_block", self._handle_new_block)
         self.search.register("block", self._search_block)
 
     def produce_block(self, block: Block):
         self._confirm_block_and_ancestors(block)
 
-    def _search_block(self, block_hash: str):
-        log("blc", "Searching for block", block_hash)
-        block = self._get_known_block(bytes.fromhex(block_hash))
+    def _search_block(self, block_hash: bytes):
+        logging.info("Searching for block %s", block_hash)
+        block = self._get_known_block(block_hash)
         if block is None:
             return None
-        return block.serialize()
+        return block.serialize().encode()
 
-    def _handle_new_block(self, message: GossipMessage):
-        block = Block.deserialize(message.data)
-        log("blc", "Received new block", block)
+    def _handle_new_block(self, peer: P2PPeer, message: bytes):
+        block = Block.deserialize(message.decode())
+        logging.info("Received new block %s", block)
 
         if not self._prevalidate_block(block.hash, block):
-            log("blc", "Invalid block", block)
-            return
+            logging.info("Invalid block %s", block)
+            return False
 
         self._add_block_and_ancestors(block)
+        return True
 
     def _prevalidate_block(self, hash: bytes, block: Block):
         if block.hash != hash:
-            log("blc", "Block hash does not match", block, block.hash.hex())
+            logging.info("Block hash does not match %s %s", block, block.hash.hex())
             return False
 
         if not block.has_difficulty(_DIFFICULTY):
-            log("blc", "Block does not meet difficulty", block, block.hash.hex())
+            logging.info(
+                "Block does not meet difficulty %s %s", block, block.hash.hex()
+            )
             return False
 
         return True
 
     def _add_block_and_ancestors(self, block: Block):
-        log("blc", "Adding block and ancestors", block)
+        logging.info("Adding block and ancestors %s", block)
         self._add_block(block)
 
         cur_block = block
@@ -383,15 +393,14 @@ class ForkManager:
 
             cur_block = self.get_parent(cur_block)
 
-        log("blc", "Found unknown parent", cur_block)
+        logging.info("Found unknown parent %s", cur_block)
 
         # we don't know the parent, need to fetch it
-        def _result_handler(result: str | None):
+        def _result_handler(result: bytes | None):
             if result is None:
-                # timed out, give up
-                return
+                return True
 
-            parent_block = Block.deserialize(result)
+            parent_block = Block.deserialize(result.decode())
             if cur_block.parent_hash != parent_block.hash:
                 return False
 
@@ -405,15 +414,16 @@ class ForkManager:
 
             # retry from start
             self._add_block_and_ancestors(block)
+            return True
 
-        self.search.search_for("block", cur_block.parent_hash.hex(), _result_handler)
+        self.search.query("block", cur_block.parent_hash, _result_handler)
         return
 
     def _add_block(self, block: Block):
         self._known_blocks[block.hash] = block
 
     def _confirm_block_and_ancestors(self, block: Block):
-        log("blc", "Confirming block and ancestors", block)
+        logging.info("Confirming block and ancestors %s", block)
         cur_block = block
         while True:
             if self._is_confirmed_block(cur_block.hash):
@@ -430,12 +440,12 @@ class ForkManager:
 
     def _confirm_block(self, block: Block):
         self._confirmed_blocks.add(block.hash)
-        self.block_storage.save(block.hash.hex(), block.serialize())
-        log("blc", "Confirmed block", block)
+        self.block_storage.save(block.hash.hex(), block.serialize().encode())
+        logging.info("Confirmed block %s", block)
 
     def _update_chain_tip(self, block: Block):
         if self.highest_block is None or block.number > self.highest_block.number:
-            log("blc", "New chain tip", block)
+            logging.info("New chain tip %s", block)
             self.highest_block = block
 
     def get_highest_block(self) -> Block | None:
@@ -458,7 +468,7 @@ class ForkManager:
         if data is None:
             return None
 
-        block = Block.deserialize(data)
+        block = Block.deserialize(data.decode())
         return block
 
     def _is_confirmed_block(self, hash: bytes) -> bool:
@@ -509,8 +519,8 @@ class ChainCanonicaliser:
             assert state.block_number == block.number
 
             state.save_to_disk(self.blockstate_storage)
-            self.blocknum_storage.save(str(block.number), block.hash.hex())
-            self.blocknum_storage.save("latest", str(block.number))
+            self.blocknum_storage.save(str(block.number), block.hash)
+            self.blocknum_storage.save("latest", str(block.number).encode())
 
             self.latest_num = block.number
             self.latest_hash = block.hash
@@ -523,7 +533,7 @@ class ChainCanonicaliser:
         data = self.block_storage.load(hash.hex())
         if data is None:
             raise ValueError("Block not found", hash)
-        return Block.deserialize(data)
+        return Block.deserialize(data.decode())
 
     def get_block_by_number(self, number: int) -> Block:
         if number == -1:
@@ -531,7 +541,7 @@ class ChainCanonicaliser:
         hash = self.blocknum_storage.load(str(number))
         if hash is None:
             raise ValueError("Block not found", number)
-        return self.get_block_by_hash(bytes.fromhex(hash))
+        return self.get_block_by_hash(hash)
 
     def get_state_at(self, number: int) -> BlockchainState:
         if number == -1:
@@ -549,7 +559,7 @@ class ChainCanonicaliser:
         latest_hash = self.blocknum_storage.load(str(latest_num))
         if latest_hash is None:
             raise ValueError("Latest block not found")
-        return bytes.fromhex(latest_hash)
+        return latest_hash
 
     def _get_latest_block(self):
         return self.get_block_by_hash(self._get_latest_hash())
@@ -580,9 +590,9 @@ class BlockchainNode:
         self.gossip = gossip
         self.search = search
 
-        self.blocknum_storage = Storage(sm, "blocknum")
-        self.block_storage = Storage(sm, "block")
-        self.blockstate_storage = Storage(sm, "blockstate")
+        self.blocknum_storage = sm.get_storage("blocknum")
+        self.block_storage = sm.get_storage("block")
+        self.blockstate_storage = sm.get_storage("blockstate")
 
         if not self.blocknum_storage.exists("latest"):
             self._create_genesis()
@@ -624,9 +634,9 @@ class BlockchainNode:
             if block is None:
                 continue
 
-            log("blc", "Produced block", block)
+            logging.info("Produced block %s", block)
             self.fork_manager.produce_block(block)
-            self.gossip.broadcast(GossipMessage("bc:new_block", block.serialize()))
+            self.gossip.broadcast("bc:new_block", block.serialize().encode())
 
     def _produce_block(self):
         tip_block = self.fork_manager.get_highest_block()
@@ -645,12 +655,12 @@ class BlockchainNode:
             block.nonce += 1
 
             if self.fork_manager.get_highest_block() != tip_block:
-                log("blc", "Chain tip changed, aborting block production")
+                logging.info("Chain tip changed, aborting block production")
                 return None
 
     def _create_genesis(self):
         genesis, genesis_state = _make_genesis()
-        self.block_storage.save(genesis.hash.hex(), genesis.serialize())
-        self.blocknum_storage.save("0", genesis.hash.hex())
-        self.blocknum_storage.save("latest", "0")
+        self.block_storage.save(genesis.hash.hex(), genesis.serialize().encode())
+        self.blocknum_storage.save("0", genesis.hash)
+        self.blocknum_storage.save("latest", b"0")
         genesis_state.save_to_disk(self.blockstate_storage)

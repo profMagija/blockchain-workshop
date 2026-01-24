@@ -1,7 +1,13 @@
-python -m bcws -L p2d gossip -p "11120" --nd &
+#!/bin/bash
+
+trap "trap - SIGTERM && kill -- -$$" SIGINT SIGTERM EXIT
+
+python -m bcws --host 127.0.0.1 --port "11120" blockchain --nd --ds &
 
 for i in 1 2 3 4 5 6
 do
-    python -m bcws gossip -p "1112$i" -P 127.0.0.1:11120 &
+    python -m bcws --host 127.0.0.1 --port "1112$i" --peer 127.0.0.1:11120 blockchain &
     sleep 1
 done
+
+wait
