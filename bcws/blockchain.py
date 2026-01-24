@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
-import time
 import typing as t
 import logging
 
+# --------8<----------------
+import time
 
+# --------8<----------------
 from .blockchain_types import Block, Transaction
 from .gossip import Gossip
 from .p2p import P2PPeer
