@@ -8,6 +8,7 @@ from .network import parse_address
 from .messaging import MessageHandler, MessageResponseHandler
 from .utils import InfiniteLoop
 import random
+import itertools
 
 _P2P_HELLO = "p2p:hello"
 _P2P_GET_PEERS = "p2p:get_peers"
@@ -54,6 +55,7 @@ class P2PNode:
         self._peers_conn: dict[TcpConnection, P2PPeer] = {}
         self.msg.register_handler(_P2P_HELLO, self._handle_hello)
         self.msg.register_handler(_P2P_GET_PEERS, self._handle_get_peers)
+        self.net.on_disconnect.register(self._on_disconnect)
         # --------8<--------
 
     def start(self) -> None:
@@ -272,6 +274,14 @@ class P2PNode:
 
         return wrapped
 
+    def _on_disconnect(self, conn: TcpConnection, initiated: bool) -> None:
+        if initiated:
+            return
+
+        peer = self._peers_conn.get(conn)
+        if peer is not None:
+            self._remove_peer(peer)
+
 
 def _make_peer_list(addrs: list[TcpAddress]) -> bytes:
     return ",".join([address_to_str(a) for a in addrs]).encode()
@@ -303,6 +313,7 @@ def network_discovery_loop(p2p: P2PNode):
     def _response_handler(conn: TcpConnection, resp: bytes | None):
         if resp is None:
             peer_map.pop(conn.addr, None)
+            known_peers.discard(conn.addr)
             return
 
         if len(resp) == 0:
@@ -329,8 +340,11 @@ def network_discovery_loop(p2p: P2PNode):
         with open("network_layout.json", "w") as f:
             json.dump(
                 [
-                    [address_to_str(k), [address_to_str(a) for a in sorted(v)]]
-                    for k, v in sorted(peer_map.items())
+                    [
+                        address_to_str(k),
+                        [address_to_str(a) for a in sorted(peer_map.get(k, []))],
+                    ]
+                    for k in set(itertools.chain(*peer_map.values()))
                 ],
                 f,
                 indent=2,

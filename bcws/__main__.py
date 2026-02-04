@@ -112,7 +112,7 @@ def messaging():
 
     try:
         while True:
-            message = "this is a test message"
+            message = input("> ")
             for conn in node.conns.values():
                 messaging.send_message(conn, "echo", message.encode(), on_response)
             time.sleep(5)
@@ -144,7 +144,10 @@ def p2p(nd: bool):
 
     try:
         while True:
-            time.sleep(1)
+            time.sleep(5)
+            print("Known peers:")
+            for peer in p2p_node.peers:
+                print(" -", peer.addr)
     except KeyboardInterrupt:
         logging.info("Shutting down P2P node...")
 
@@ -182,7 +185,7 @@ def gossip(nd: bool):
 
     try:
         while True:
-            msg = "hello world"
+            msg = input("> ")
             sender = f"{_host}:{_port}"
             payload = f"{sender}\0{msg}".encode()
             gossip.broadcast("chat", payload)
@@ -262,9 +265,6 @@ def blockchain(nd: bool, ds: bool, state_dir: str):
                 logging.exception("Error in state dump thread: %s", e)
 
         run_in_background(_do_state_dump)
-
-    while True:
-        time.sleep(10)
 
     while True:
         action = input("[s]end, [b]alance, [n]once, [l]atest, [q]uit: ").lower()
